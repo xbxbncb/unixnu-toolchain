@@ -1,0 +1,109 @@
+name: Build cross toolchain
+
+# The toolchain does not depend on any device repository: it is built from
+# UniXNU core's scripts/linux (setup-toolchain.py and its patches). Keeping it
+# in its own repository means a device kernel run downloads the published
+# asset instead of spending 1-3 hours building LLVM with the XNU builtin patch,
+# and several device repositories share one copy.
+#
+# Trigger a rebuild after bumping UNIXNU_REF. The asset name hashes
+# scripts/linux, so an unchanged toolchain is a no-op even on a manual run
+# (pass force=true to rebuild anyway).
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when the asset already exists
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/toolchain.yml
+
+env:
+  UNIXNU_REPO: UniXNU/UniXNU
+  # Keep in step with the device repositories' kernel.yml. Asset names hash
+  # scripts/linux, so a ref whose scripts/linux is unchanged stays compatible.
+  UNIXNU_REF: 16e592abee8a550dec8154ed1f38b5ebc4f16213
+  UNIXNU_TOOLCHAIN: /opt/unixnu-linux
+  TOOLCHAIN_RELEASE: unixnu-toolchain
+
+permissions:
+  contents: write
+
+concurrency:
+  group: toolchain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  toolchain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout UniXNU core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UNIXNU_REPO }}
+          ref: ${{ env.UNIXNU_REF }}
+          path: UniXNU
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -o Acquire::Retries=10 -o Acquire::http::Timeout=30
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=10 -o Acquire::http::Timeout=30 \
+            ripgrep file zstd
+
+      - name: Resolve asset name
+        id: key
+        run: |
+          key=$(find UniXNU/scripts/linux -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+          echo "asset=unixnu-toolchain-ubuntu-24.04-$key.tar.zst" >> "$GITHUB_OUTPUT"
+          echo "asset: unixnu-toolchain-ubuntu-24.04-$key.tar.zst"
+
+      - name: Look for a published asset
+        id: lookup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          asset="${{ steps.key.outputs.asset }}"
+          if gh release view "$TOOLCHAIN_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 &&
+             gh release download "$TOOLCHAIN_RELEASE" --repo "$GITHUB_REPOSITORY" \
+               --pattern "$asset" --dir "$RUNNER_TEMP" 2>/dev/null; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "already published: $asset ($(du -h "$RUNNER_TEMP/$asset" | cut -f1))"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "building $asset"
+          fi
+
+      - name: Install Linux cross toolchain
+        if: steps.lookup.outputs.hit != 'true' || inputs.force
+        timeout-minutes: 300
+        run: |
+          # LLVM from source (the XNU builtin patch has no upstream
+          # equivalent) plus cctools-port, mig, iig and lzfse. Installs shims
+          # into /usr/bin and CommandLineTools, which is why device workflows
+          # still run the script after restoring the prefix.
+          sudo --preserve-env=UNIXNU_TOOLCHAIN,DEBIAN_FRONTEND \
+            python3 UniXNU/scripts/linux/setup-toolchain.py "$UNIXNU_TOOLCHAIN"
+
+      - name: Publish toolchain
+        if: steps.lookup.outputs.hit != 'true' || inputs.force
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 2 GiB is GitHub's per-asset limit; zstd -12 keeps this well under.
+          set -o pipefail
+          asset="${{ steps.key.outputs.asset }}"
+          sudo tar --numeric-owner -C /opt -cf - unixnu-linux | zstd -T0 -12 -q -o "$RUNNER_TEMP/$asset"
+          ls -lh "$RUNNER_TEMP/$asset"
+          gh release view "$TOOLCHAIN_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TOOLCHAIN_RELEASE" --repo "$GITHUB_REPOSITORY" \
+              --title "Prebuilt Linux cross toolchain" \
+              --notes "LLVM with the UniXNU XNU builtin patch plus cctools-port, mig, iig, lzfse and the runner shims. Asset names hash scripts/linux/ of the pinned UniXNU core; setup-toolchain.py reinstalls the shims that live outside the prefix."
+          gh release upload "$TOOLCHAIN_RELEASE" "$RUNNER_TEMP/$asset" \
+            --repo "$GITHUB_REPOSITORY" --clobber
